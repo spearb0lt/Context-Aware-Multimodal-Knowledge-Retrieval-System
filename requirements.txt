@@ -1,0 +1,48 @@
+# =====================================================
+# Context-Aware Multimodal Knowledge Retrieval System
+# Requirements
+# =====================================================
+
+# --- PDF Parsing & Element Extraction ---
+unstructured[all-docs]>=0.15.0
+pdfplumber>=0.11.0
+pymupdf>=1.24.0          # fitz - fast PDF reading & metadata
+pillow>=10.0.0
+lxml>=5.0.0
+
+# --- LangChain Core ---
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+
+# --- LLM Integrations ---
+langchain-google-genai>=2.0.0   # Gemini (vision + text)
+langchain-groq>=0.2.0            # Groq (fast LLM for text/tables)
+langchain-huggingface>=0.1.0     # HuggingFace embeddings
+
+# --- Google Generative AI ---
+google-generativeai>=0.8.0
+
+# --- Embeddings ---
+sentence-transformers>=3.0.0
+
+# --- Vector Store ---
+chromadb>=0.5.0
+
+# --- Tokenization ---
+tiktoken>=0.7.0
+
+# --- Data & Utilities ---
+pandas>=2.0.0
+numpy>=1.26.0
+python-dotenv>=1.0.0
+opencv-python-headless>=4.9.0
+matplotlib>=3.8.0
+ipywidgets>=8.0.0
+tqdm>=4.66.0
+
+# --- Jupyter ---
+ipykernel>=6.29.0
+ipython>=8.0.0
+jupyter>=1.0.0
+notebook>=7.0.0
