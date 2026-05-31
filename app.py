@@ -110,8 +110,10 @@ _SS_DEFAULTS: dict = {
     "use_clip":     True,
     "use_history":  True,
     "use_hyde":     False,
-    "use_rerank":   False,
-    "rerank_top_k": 6,
+    "use_rerank":    False,
+    "rerank_top_k":  6,
+    "use_multiquery": False,
+    "n_queries":     3,
     # Document state
     "rag_ready":    False,
     "pdf_path":     None,
@@ -762,6 +764,51 @@ def _dedup(lst: list, seen: set) -> list:
     return result
 
 
+def _retrieve_with_scores_app(vs, ds, query: str, k: int) -> list:
+    """
+    Query vectorstore with cosine similarity scores, look up originals in docstore.
+    Returns list of original element dicts, each with '_score' key attached (0-1).
+    Falls back to scoreless retrieval on any error.
+    """
+    try:
+        scored = vs.similarity_search_with_relevance_scores(query, k=k)
+    except Exception:
+        docs = vs.similarity_search(query, k=k)
+        scored = [(doc, None) for doc in docs]
+    results = []
+    for doc, score in scored:
+        doc_id = doc.metadata.get(DOC_ID_KEY)
+        if not doc_id:
+            continue
+        originals = ds.mget([doc_id])
+        if originals and originals[0] is not None:
+            elem = originals[0]
+            if isinstance(elem, dict):
+                elem = dict(elem)   # shallow copy
+                if score is not None:
+                    elem["_score"] = round(float(score), 3)
+            results.append(elem)
+    return results
+
+
+def _generate_query_variants_app(question: str, n: int, groq_key: str) -> list:
+    """Generate N alternative phrasings of question using Groq for multi-query retrieval."""
+    from langchain_groq import ChatGroq
+    from langchain_core.messages import HumanMessage as HM
+    prompt = (
+        f"Generate exactly {n} different phrasings of the following question. "
+        f"Use different vocabulary and angle to maximize retrieval coverage. "
+        f"Output one question per line, no numbering.\n\nQuestion: {question}"
+    )
+    try:
+        llm  = ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=groq_key, temperature=0.5)
+        resp = llm.invoke([HM(content=prompt)])
+        lines = [l.strip() for l in resp.content.strip().splitlines() if l.strip()]
+        return [question] + lines[:n]
+    except Exception:
+        return [question]
+
+
 def build_rag_prompt(context: dict, question: str, history: list | None = None) -> list:
     from langchain_core.messages import HumanMessage
 
@@ -886,6 +933,9 @@ def query_rag(
     use_hyde: bool = False,
     use_rerank: bool = False,
     rerank_top_k: int = 6,
+    use_multiquery: bool = False,
+    n_queries: int = 3,
+    groq_key: str = "",
 ) -> tuple[Generator, str, dict, dict]:
     """
     Full 3-pipeline RAG query.
@@ -906,18 +956,31 @@ def query_rag(
         except Exception:
             query_text = question  # fall back silently
 
-    # ── Pipeline A: summary-based ─────────────────────────────────────────
-    retriever.search_kwargs = {"k": k}
-    raw_a = retriever.invoke(query_text)
-    ctx_a = classify_docs(raw_a)
+    # ── Optional: Multi-query — generate N query variants ─────────────────
+    if use_multiquery and groq_key:
+        all_variants = _generate_query_variants_app(question, n_queries, groq_key)
+        # HyDE-expanded text is the primary query; replace the original in variants
+        queries = [query_text] + all_variants[1:]
+    else:
+        queries = [query_text]
 
-    # ── Pipeline B: raw atomic ────────────────────────────────────────────
+    # ── Pipeline A: summary-based (with cosine similarity scores) ─────────
+    vs = retriever.vectorstore
+    ds = retriever.docstore
+    all_raw_a = []
+    for q in queries:
+        all_raw_a.extend(_retrieve_with_scores_app(vs, ds, q, k))
+    ctx_a = classify_docs(_dedup(all_raw_a, set()))
+
+    # ── Pipeline B: raw atomic (with cosine similarity scores) ────────────
     ctx_b = {"texts": [], "tables": [], "images": []}
     if use_raw:
         try:
-            raw_retriever.search_kwargs = {"k": k_raw}
-            raw_b = raw_retriever.invoke(query_text)
-            ctx_b = classify_docs(raw_b)
+            vs_raw = raw_retriever.vectorstore
+            all_raw_b = []
+            for q in queries:
+                all_raw_b.extend(_retrieve_with_scores_app(vs_raw, ds, q, k_raw))
+            ctx_b = classify_docs(_dedup(all_raw_b, set()))
         except Exception:
             pass
 
@@ -952,8 +1015,9 @@ def query_rag(
         "B_texts": len(ctx_b["texts"]), "B_tables": len(ctx_b["tables"]),
         "C_images": len(clip_imgs),
         "total_texts": len(context["texts"]), "total_tables": len(context["tables"]), "total_images": len(context["images"]),
-        "hyde_used":    use_hyde and query_text != question,
-        "rerank_used":  use_rerank,
+        "hyde_used":       use_hyde and query_text != question,
+        "rerank_used":     use_rerank,
+        "multiquery_used": use_multiquery and len(queries) > 1,
     }
 
     messages     = build_rag_prompt(context, question, history=history)
@@ -1094,9 +1158,14 @@ def render_sources(sources: dict, src_offset: int = 1) -> int:
             page  = t.get("page","?") if isinstance(t, dict) else "?"
             label = t.get("label","text") if isinstance(t, dict) else "text"
             text  = t.get("text","") if isinstance(t, dict) else str(t)
+            score = t.get("_score") if isinstance(t, dict) else None
             color = LABEL_COLORS.get(label,"#555")
-            with st.expander(f"[{n}] {label.upper()} · Page {page}", expanded=False):
+            score_str = f" · {score:.2f}" if score is not None else ""
+            with st.expander(f"[{n}] {label.upper()} · Page {page}{score_str}", expanded=False):
                 st.markdown(f'<span style="background:{color};color:white;padding:2px 8px;border-radius:10px;font-size:11px">{label.upper()}</span> **Page {page}**', unsafe_allow_html=True)
+                if score is not None:
+                    sc = "#2e7d32" if score >= 0.75 else "#f57f17" if score >= 0.55 else "#c62828"
+                    st.markdown(f'<span style="background:{sc};color:white;padding:1px 6px;border-radius:8px;font-size:11px;font-weight:700">cosine: {score:.2f}</span>', unsafe_allow_html=True)
                 st.text(text[:1500] + ("…" if len(text) > 1500 else ""))
             n += 1
 
@@ -1105,8 +1174,13 @@ def render_sources(sources: dict, src_offset: int = 1) -> int:
         for tbl in sources["tables"]:
             page    = tbl.get("page","?") if isinstance(tbl, dict) else "?"
             caption = tbl.get("caption","") if isinstance(tbl, dict) else ""
-            with st.expander(f"[{n}] TABLE · Page {page}" + (f" — {caption[:60]}" if caption else ""), expanded=False):
+            score   = tbl.get("_score") if isinstance(tbl, dict) else None
+            score_str = f" · {score:.2f}" if score is not None else ""
+            with st.expander(f"[{n}] TABLE · Page {page}{score_str}" + (f" — {caption[:60]}" if caption else ""), expanded=False):
                 st.markdown(f'<span style="background:#2e7d32;color:white;padding:2px 8px;border-radius:10px;font-size:11px">TABLE</span> **Page {page}**', unsafe_allow_html=True)
+                if score is not None:
+                    sc = "#2e7d32" if score >= 0.75 else "#f57f17" if score >= 0.55 else "#c62828"
+                    st.markdown(f'<span style="background:{sc};color:white;padding:1px 6px;border-radius:8px;font-size:11px;font-weight:700">cosine: {score:.2f}</span>', unsafe_allow_html=True)
                 if caption:
                     st.caption(caption)
                 md = tbl.get("markdown","") if isinstance(tbl, dict) else ""
@@ -1140,14 +1214,16 @@ def render_sources(sources: dict, src_offset: int = 1) -> int:
 
 
 def render_pipeline_stats(stats: dict):
-    cols = st.columns(6)
+    cols = st.columns(8)
     labels = [
-        ("A texts", stats.get("A_texts",0), "#007acc"),
+        ("A texts",  stats.get("A_texts",0),  "#007acc"),
         ("A tables", stats.get("A_tables",0), "#2e7d32"),
         ("A images", stats.get("A_images",0), "#6a1b9a"),
         ("B tables", stats.get("B_tables",0), "#ad1457"),
         ("C images", stats.get("C_images",0), "#00695c"),
-        ("HyDE", "✓" if stats.get("hyde_used") else "✗", "#795548"),
+        ("HyDE",    "✓" if stats.get("hyde_used")       else "✗", "#795548"),
+        ("Rerank",  "✓" if stats.get("rerank_used")     else "✗", "#37474f"),
+        ("MultiQ",  "✓" if stats.get("multiquery_used") else "✗", "#1565c0"),
     ]
     for col, (label, val, color) in zip(cols, labels):
         col.markdown(
@@ -1346,6 +1422,9 @@ with st.sidebar:
         st.session_state.use_rerank  = st.toggle("Cross-encoder reranking",          st.session_state.use_rerank, help="Rerank retrieved chunks with cross-encoder/ms-marco-MiniLM-L-6-v2 (better precision, ~200ms overhead)")
         if st.session_state.use_rerank:
             st.session_state.rerank_top_k = st.slider("Rerank — keep top k", 2, 12, st.session_state.rerank_top_k)
+        st.session_state.use_multiquery = st.toggle("Multi-query retrieval", st.session_state.use_multiquery, help="Generate N Groq query variants and union results for broader recall")
+        if st.session_state.use_multiquery:
+            st.session_state.n_queries = st.slider("Multi-query — N variants", 2, 5, st.session_state.n_queries)
 
     # ── System stats ───────────────────────────────────────────────────────
     if st.session_state.rag_ready:
@@ -1523,12 +1602,17 @@ with tab_chat:
             # Compact pipeline stats
             s = msg.get("stats", {})
             if s:
+                _flags = []
+                if s.get("hyde_used"):   _flags.append("HyDE ✓")
+                if s.get("rerank_used"):     _flags.append("Rerank ✓")
+                if s.get("multiquery_used"): _flags.append("MultiQ ✓")
+                if msg.get("history_used"):  _flags.append("History ✓")
                 st.caption(
                     f"Pipeline A: {s.get('A_texts',0)}t/{s.get('A_tables',0)}tbl/{s.get('A_images',0)}img  "
                     f"| B: {s.get('B_tables',0)}tbl  "
                     f"| C: {s.get('C_images',0)}img  "
                     f"| Model: `{msg.get('model_used','?')}`"
-                    + ("  | HyDE ✓" if s.get("hyde_used") else "")
+                    + (f"  | {' | '.join(_flags)}" if _flags else "")
                 )
             # Sources collapsible
             srcs = msg.get("sources", {})
@@ -1537,33 +1621,65 @@ with tab_chat:
                 with st.expander(f"📌 {total_srcs} Source(s) used", expanded=False):
                     render_sources(srcs)
 
+    # ── Per-question options bar ────────────────────────────────────────────
+    with st.container():
+        opt_cols = st.columns([1, 1, 1, 1, 4])
+        q_use_history = opt_cols[0].toggle(
+            "💬 History", value=st.session_state.use_history, key="q_history",
+            help="Include last 3 Q&A turns as context for this question"
+        )
+        q_use_hyde = opt_cols[1].toggle(
+            "🔮 HyDE",    value=st.session_state.use_hyde,    key="q_hyde",
+            help="HyDE: generate hypothetical answer then use it for retrieval"
+        )
+        q_use_rerank = opt_cols[2].toggle(
+            "🎯 Rerank",  value=st.session_state.use_rerank,  key="q_rerank",
+            help="Cross-encoder reranking after retrieval (better precision, ~200ms overhead)"
+        )
+        q_use_multiquery = opt_cols[3].toggle(
+            "🔀 MultiQ",  value=st.session_state.use_multiquery, key="q_multiquery",
+            help="Multi-query: generate N Groq variants and union retrieval results for broader recall"
+        )
+
     # ── Chat input ─────────────────────────────────────────────────────────
     question = st.chat_input("Ask anything about the document…  (Ctrl+Enter to send)")
 
     if question:
         with st.chat_message("user"):
+            flag_parts = []
+            if q_use_history:    flag_parts.append("💬 History")
+            if q_use_hyde:       flag_parts.append("🔮 HyDE")
+            if q_use_rerank:     flag_parts.append("🎯 Rerank")
+            if q_use_multiquery: flag_parts.append("🔀 MultiQ")
             st.markdown(question)
+            if flag_parts:
+                st.caption("  ".join(flag_parts))
 
         with st.chat_message("assistant"):
-            # Build history for context
-            history = st.session_state.chat_history if st.session_state.use_history else None
+            # Build history for context (respects per-question toggle)
+            history = st.session_state.chat_history[-3:] if q_use_history and st.session_state.chat_history else None
 
             with st.spinner("Retrieving from 3 pipelines…"):
                 answer_stream, model_used, sources, stats = query_rag(
-                    question       = question,
-                    images         = st.session_state.images,
-                    pdf_hash_val   = st.session_state.pdf_hash,
+                    question         = question,
+                    images           = st.session_state.images,
+                    pdf_hash_val     = st.session_state.pdf_hash,
                     docstore_backing = st.session_state.docstore_backing,
-                    embedding_key  = st.session_state.embedding_model,
-                    google_key     = st.session_state.google_api_key,
-                    answer_model   = st.session_state.answer_model,
-                    k              = st.session_state.k_summary,
-                    k_raw          = st.session_state.k_raw,
-                    k_clip         = st.session_state.k_clip,
-                    use_raw        = st.session_state.use_raw,
-                    use_clip       = st.session_state.use_clip,
-                    history        = history,
-                    use_hyde       = st.session_state.use_hyde,
+                    embedding_key    = st.session_state.embedding_model,
+                    google_key       = st.session_state.google_api_key,
+                    answer_model     = st.session_state.answer_model,
+                    k                = st.session_state.k_summary,
+                    k_raw            = st.session_state.k_raw,
+                    k_clip           = st.session_state.k_clip,
+                    use_raw          = st.session_state.use_raw,
+                    use_clip         = st.session_state.use_clip,
+                    history          = history,
+                    use_hyde         = q_use_hyde,
+                    use_rerank       = q_use_rerank,
+                    rerank_top_k     = st.session_state.rerank_top_k,
+                    use_multiquery   = q_use_multiquery,
+                    n_queries        = st.session_state.n_queries,
+                    groq_key         = st.session_state.groq_api_key,
                 )
 
             # ── Stream the answer ──────────────────────────────────────────
@@ -1580,11 +1696,12 @@ with tab_chat:
 
         # Save to chat history
         st.session_state.chat_history.append({
-            "question":   question,
-            "answer":     answer,
-            "sources":    sources,
-            "model_used": model_used,
-            "stats":      stats,
+            "question":    question,
+            "answer":      answer,
+            "sources":     sources,
+            "model_used":  model_used,
+            "stats":       stats,
+            "history_used": q_use_history,
         })
 
 
