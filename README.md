@@ -18,6 +18,7 @@
    - [Step 2 — Persistent Disk Cache](#step-2--persistent-disk-cache)
    - [Step 3 — Text & Table Summarization (Groq LLaMA)](#step-3--text--table-summarization-groq-llama)
    - [Step 4 — Image Summarization (Gemini Vision)](#step-4--image-summarization-gemini-vision)
+   - [Step 4b — OCR Text Extraction](#step-4b--ocr-text-extraction)
    - [Step 5 — CLIP Visual Embeddings (Pipeline C)](#step-5--clip-visual-embeddings-pipeline-c)
    - [Step 6 — Embedding Model & ChromaDB Setup](#step-6--embedding-model--chromadb-setup)
    - [Step 7 — Multi-Vector Retriever Architecture](#step-7--multi-vector-retriever-architecture)
@@ -36,6 +37,8 @@
     - [Running the App](#running-the-app)
     - [Chat Interface](#chat-interface)
     - [Document Explorer](#document-explorer)
+    - [Chunk Lookup Tab](#chunk-lookup-tab)
+    - [OCR Engine Selection](#ocr-engine-selection)
     - [Conversation Export](#conversation-export)
 12. [Jupyter Notebook Reference](#12-jupyter-notebook-reference)
 13. [Caching Strategy](#13-caching-strategy)
@@ -58,6 +61,7 @@ This system turns any PDF document into a fully queryable multimodal knowledge b
 | Captions, footnotes, references | Docling structural labels | LLM summary → BGE embedding |
 | Tables | Docling + pdfplumber fallback | LLM analytical summary + raw markdown |
 | Figures, charts, diagrams | Docling image extraction | Gemini Vision description + CLIP image embedding |
+| OCR text from figures | pytesseract / EasyOCR on extracted images | Raw text → BGE raw-atomic index (Pipeline B) |
 | Mathematical formulas | Docling formula detection | Raw LaTeX/text in BGE raw-atomic index |
 | Form fields / key-value pairs | Docling form detection | Raw key:value text in BGE raw-atomic index |
 
@@ -220,6 +224,8 @@ ChromaDB's Rust-based HNSW backend serializes segment files per-client. When mul
 | **Orchestration** | LangChain 1.x + langchain-classic | ≥1.3.0 | Chains, retrievers, document objects |
 | **UI** | Streamlit | ≥1.35.0 | Full web application with streaming answers |
 | **Notebook UI** | ipywidgets | ≥8.0.0 | Interactive Q&A widget in Jupyter |
+| **OCR (option A)** | pytesseract | ≥0.3.10 | Python wrapper for Tesseract OCR engine — requires system binary |
+| **OCR (option B)** | easyocr | ≥1.7.0 | Pure-Python deep-learning OCR — no system binary, ~100 MB model download |
 
 ---
 
@@ -279,6 +285,43 @@ See the [Pinned Requirements](#pinned-requirements-exact-versions-for-long-term-
 
 ---
 
+### Optional: OCR Engine Setup
+
+The system supports two OCR engines for extracting embedded text from figures. Both are optional — if neither is available, the pipeline continues with empty OCR strings and all other functionality is unaffected.
+
+**Option A — EasyOCR (recommended; no system binary required):**
+
+```bash
+pip install easyocr
+```
+
+EasyOCR downloads a ~100 MB deep-learning model on first use. No system-level installation is needed. Input to `readtext()` must be a NumPy array (the pipeline handles this conversion internally from PIL Images).
+
+**Option B — Tesseract + pytesseract:**
+
+```bash
+pip install pytesseract
+```
+
+The `pytesseract` package is only a Python wrapper — it requires a separate **Tesseract binary** installed at the system level:
+
+| Platform | Installation |
+|---|---|
+| **Windows** | Download installer from [https://github.com/UB-Mannheim/tesseract/wiki](https://github.com/UB-Mannheim/tesseract/wiki) · default path: `C:\Program Files\Tesseract-OCR\` |
+| **macOS** | `brew install tesseract` |
+| **Linux (Debian/Ubuntu)** | `sudo apt install tesseract-ocr` |
+
+`pytesseract` auto-detects the default install path. If Tesseract is installed to a non-default location, set:
+
+```python
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\custom\path\tesseract.exe"
+```
+
+> **Tip:** For most use cases EasyOCR delivers equal or better results without any system dependency. Use Tesseract if you already have it installed or need its specific language packs.
+
+---
+
 ### Pinned Requirements — Exact Versions for Long-Term Reproducibility
 
 The following are the **exact versions verified to work together** as of the development environment (Python 3.14.4, Windows 11). Copy the block below into a file named `requirements-pinned.txt` and install with `pip install -r requirements-pinned.txt`.
@@ -301,6 +344,10 @@ PyMuPDF==1.27.2.3
 Pillow==12.2.0
 lxml==6.1.1
 opencv-python-headless==4.13.0.92
+
+# --- OCR (optional — install one or both; see README for Tesseract binary setup) ---
+pytesseract==0.3.13          # OCR option A — requires Tesseract binary on system PATH
+easyocr==1.7.2               # OCR option B — pure Python, no system binary needed
 
 # --- LangChain Core ---
 langchain==1.3.2
@@ -652,6 +699,7 @@ PDF_HASH = hashlib.sha256(Path(PDF_PATH).read_bytes()).hexdigest()[:16]
 | `groq_summ_v2:{pdf_hash}:llama-3.3-70b-versatile:table:{i}` | Table summary for table i | ~800 bytes each |
 | `gemini_img_v1:{pdf_hash}:gemini-2.5-flash:{i}` | Image description for figure i | ~1–3 KB each |
 | `clip_emb_v1:ViT-B-32:openai:{pdf_hash}` | All CLIP image embeddings as float list | ~12 KB per 6 images |
+| `img_ocr_v1:{pdf_hash}:{engine}:{i}` | OCR text for image i (engine = `"tesseract"` or `"easyocr"`) | ~0.1–2 KB each |
 | `docstore_v1:{pdf_hash}:{embedding_model}` | Full docstore backing dict (uuid → element) | 5–50 MB |
 
 **Cache miss behavior:** Only successful API responses are cached. If Groq/Gemini returns an error or rate-limit fallback, the result is NOT cached — forcing a retry on the next run.
@@ -700,6 +748,44 @@ Each extracted figure is described by **Gemini 2.5 Flash Vision** with a compreh
 The description is stored in `image_summaries[i]` and indexed in ChromaDB alongside text and table summaries. When this image is retrieved at query time, both the text description AND the actual base64 image are sent to Gemini for the final answer — enabling true visual question answering.
 
 **Quota management:** Gemini 2.5 Flash has a strict 20 RPD free-tier limit. Images are summarized once and cached permanently — never re-processed for the same PDF.
+
+---
+
+### Step 4b — OCR Text Extraction
+
+After images are described by Gemini Vision, the system optionally runs **OCR (Optical Character Recognition)** on the same extracted figures. This pulls machine-readable text from figures that contain embedded labels, annotations, code snippets, or table cells rendered as images.
+
+**Two OCR engines are supported:**
+
+| Engine | Package | System Binary | First-run Download | Best For |
+|---|---|---|---|---|
+| Tesseract | `pytesseract` | Required (see [setup](#optional-ocr-engine-setup)) | None | Fast, low-memory, wide language support |
+| EasyOCR | `easyocr` | Not required | ~100 MB model | Better accuracy on diverse and complex layouts |
+
+**Cache key per engine:**
+
+```python
+f"img_ocr_v1:{pdf_hash}:{engine}:{i}"   # engine = "tesseract" or "easyocr"
+```
+
+Each engine has its own independent cache entry. Switching engines triggers a fresh OCR pass while the other engine's results remain cached. Both engines' results can coexist in the cache simultaneously.
+
+**EasyOCR input requirement:** `readtext()` requires a **NumPy array** — not a PIL Image. The pipeline converts internally:
+
+```python
+import numpy as np
+texts = reader.readtext(np.array(pil_image), detail=0)
+```
+
+**Integration with Pipeline B:** OCR text for each image is indexed into the raw-atomic index (`rag_raw_{model}`) using the **same UUID** as the image element. This lets keyword and semantic queries find images by their embedded text — a figure containing "BLEU 41.0" can be retrieved by querying "what is the BLEU score?".
+
+**Graceful fallback:** If the selected engine is unavailable (Tesseract binary missing, or easyocr not installed), the pipeline assigns empty strings to all images and continues without interruption. The progress log reports the skip reason.
+
+**Switching the engine:**
+- **Streamlit app:** Use the "OCR Engine" radio button in the sidebar under **Model Settings**
+- **Notebook:** Set `OCR_ENGINE = "tesseract"` or `OCR_ENGINE = "easyocr"` in the OCR cell (Cell 23)
+
+**App pipeline step:** In the Streamlit app's `run_full_pipeline()`, OCR runs as **Step 4/8** (after Gemini Vision image summarization, before CLIP embedding). The notebook runs it as an independent cell between the image description cell and the CLIP embedding cell.
 
 ---
 
@@ -1034,11 +1120,13 @@ This creates a verifiable answer where each factual claim traces back to a speci
 
 ### Features
 
-The Streamlit app (`app.py`, ~1700 lines) provides a complete web interface with all notebook features plus:
+The Streamlit app (`app.py`, ~2150 lines) provides a complete web interface with all notebook features plus:
 
 - **Streaming answers** via `st.write_stream()` — text appears token-by-token
 - **Auto model fallback** — automatically tries fallback models if quota is exhausted
-- **Document Explorer** tab — browse all extracted elements (texts, tables, images, metadata)
+- **Document Explorer** tab — browse all extracted elements with sparse / dense / hybrid search modes across Text, Tables, and Images sub-tabs
+- **Chunk Lookup** tab — direct semantic chunk search with cosine scores; no LLM generation, instant results
+- **OCR Engine selection** — Tesseract or EasyOCR radio in the sidebar; OCR text indexed and searchable
 - **Per-query feature toggles** — four independent toggles above every question
 - **Pipeline contribution stats** — 8-metric dashboard per answer
 - **Full conversation export** — download entire chat as self-contained HTML
@@ -1075,6 +1163,12 @@ Pipeline C — CLIP visual k:    [1 ──── 6]           default: 2
 [ ] Multi-query retrieval         → [N variants slider if enabled]
 ```
 
+**Sidebar — Model Settings (expander):**
+```
+OCR Engine:   ○ Tesseract    ● EasyOCR
+```
+Changing the engine affects the next pipeline run for the current PDF. Each engine uses an independent cache key so results from both can coexist.
+
 **Per-question toggles (above chat input):**
 ```
 💬 History  |  🔮 HyDE  |  🎯 Rerank  |  🔀 MultiQ
@@ -1102,12 +1196,55 @@ These override sidebar defaults for each individual question.
 
 ### Document Explorer
 
-A second tab allows browsing all extracted elements:
+A second tab allows browsing all extracted elements. All three content sub-tabs support three search modes:
 
-- **Text tab:** Filter by keyword and page number; shows text + LLM summary for each chunk
-- **Tables tab:** Renders each table as HTML with caption
-- **Images tab:** Shows all figures with captions and Gemini descriptions
-- **Metadata tab:** PDF title, author, pages, cache info, vector counts
+| Search Mode | Behavior | Use when |
+|---|---|---|
+| **Sparse** | Case-insensitive keyword substring match — instant, no model required | Searching for exact terms, names, numbers |
+| **Dense** | BGE cosine similarity against the summary vector store (semantic search) | Broad topic or concept queries |
+| **Hybrid** | Dense results first (sorted by score), then sparse-only matches appended | Best overall coverage — semantic + keyword fallback |
+
+- **Text sub-tab:** Filter by keyword, page number, and search mode; each result shows the raw text and its LLM-generated summary
+- **Tables sub-tab:** Filter by keyword and search mode; renders the HTML table with caption and LLM summary
+- **Images sub-tab:** Filter by keyword and search mode; shows figures with captions and Gemini descriptions; each image has an expandable **"OCR Text"** section showing text extracted by the OCR engine — OCR text is also included in keyword matching
+- **Metadata tab:** PDF title, author, page count, cache info, vector counts, and embedding model in use
+
+---
+
+### Chunk Lookup Tab
+
+The third tab provides direct access to the retrieval layer without LLM generation — useful for debugging retrieval quality, verifying indexing, and understanding exactly what the system knows.
+
+**Features:**
+- Enter any query to instantly see which chunks would be retrieved and with what cosine scores
+- **Search mode selector:** Dense / Sparse / Hybrid (same semantics as Document Explorer)
+- In **Dense** and **Hybrid** modes, CLIP image similarity also runs — showing which figures visually match the query
+- Each result shows a colored cosine badge: green ≥ 0.75, orange 0.55–0.74, red < 0.55
+- **No LLM calls are made** — results are instant after the index is built
+- Sparse mode scans all docstore elements by keyword substring across all modalities
+- All three pipelines (A summary, B raw-atomic, C CLIP) contribute results, exactly as in a real query
+
+---
+
+### OCR Engine Selection
+
+The **Model Settings** expander in the sidebar exposes an OCR engine radio button:
+
+```
+── Model Settings ──────────────────────────────────
+OCR Engine:   ○ Tesseract    ● EasyOCR
+```
+
+| Option | Engine | Requirement |
+|---|---|---|
+| `tesseract` | Tesseract OCR (via pytesseract) | Tesseract binary must be installed on the system path |
+| `easyocr` | EasyOCR deep-learning model | No system binary — downloads ~100 MB model on first use |
+
+The engine choice is stored in `st.session_state.ocr_engine`. The cache key for OCR results includes the engine name (`img_ocr_v1:{hash}:{engine}:{i}`), so switching engines re-runs OCR for that engine while keeping the other engine's cached results intact.
+
+If the selected engine is unavailable at run time, the app logs a warning and continues with empty OCR strings — all other pipeline steps are unaffected.
+
+---
 
 ### Conversation Export
 
@@ -1124,7 +1261,7 @@ A "Download Conversation" button appears in the sidebar as soon as the first que
 
 ## 12. Jupyter Notebook Reference
 
-The notebook (`multimodal_rag_complete.ipynb`) has 63 cells organized into numbered steps:
+The notebook (`multimodal_rag_complete.ipynb`) has 64 cells organized into numbered steps:
 
 | Step | Description |
 |---|---|
@@ -1136,6 +1273,7 @@ The notebook (`multimodal_rag_complete.ipynb`) has 63 cells organized into numbe
 | 5 | Preview extracted images, tables, text chunks |
 | 6 | Groq summarization chains + batch summarization |
 | 7 | Gemini Vision image descriptions |
+| 7b | OCR text extraction from figures — `OCR_ENGINE = "tesseract"` or `"easyocr"`; per-engine diskcache keys; graceful fallback if engine unavailable |
 | 8 | CLIP ViT-B-32 embeddings + isolated clip_index |
 | — | Embedding model config + ChromaDB + MultiVectorRetriever setup |
 | — | Multi-vector indexing (`_add_to_retriever`) |
@@ -1309,6 +1447,19 @@ User submits question "q"
 | `use_multiquery` | False | Groq multi-query variant generation |
 | `n_queries` | 3 | Number of query variants to generate |
 
+### OCR Engine (Notebook)
+
+Set the `OCR_ENGINE` variable in Cell 23 before running the OCR step:
+
+```python
+OCR_ENGINE = "easyocr"    # or "tesseract"
+```
+
+| Value | Engine | Requirement |
+|---|---|---|
+| `"easyocr"` | EasyOCR deep-learning OCR | `pip install easyocr`; no system binary; ~100 MB download on first use |
+| `"tesseract"` | Tesseract + pytesseract | `pip install pytesseract` + Tesseract binary (see [OCR Engine Setup](#optional-ocr-engine-setup)) |
+
 ### Embedding Model Switch
 
 To switch embedding models, change `EMBEDDING_MODEL = "minilm"` and re-run from the embedding setup cell. A fresh ChromaDB collection (`rag_minilm`) will be created automatically. Old `rag_bge` data is unaffected.
@@ -1338,6 +1489,10 @@ cache = diskcache.Cache("./cache", size_limit=int(4e9))  # 4 GB
 
 **Summary vs raw trade-off:** Pipeline A (summary) and Pipeline B (raw) serve different query types. For factual number lookups use `use_raw=True` (default). For broad semantic questions, Pipeline A dominates. For visual questions, Pipeline C (CLIP) adds recall that neither text pipeline can provide.
 
+**OCR on diagram-heavy documents:** OCR extracts text from figure bitmaps, not from PDF vector paths. Architectural diagrams, flow charts, and attention visualization plots typically contain very little machine-readable bitmap text — OCR returning 0 characters for such figures is expected and correct. OCR adds the most value for figures containing annotated screenshots, table images, or text-heavy overlays.
+
+**Tesseract binary vs pytesseract wrapper:** `pip install pytesseract` installs only the Python wrapper. Tesseract OCR functionality requires a separate system-level binary installation (see [OCR Engine Setup](#optional-ocr-engine-setup)). EasyOCR has no such requirement.
+
 ---
 
 ## 18. Component References
@@ -1355,6 +1510,8 @@ cache = diskcache.Cache("./cache", size_limit=int(4e9))  # 4 GB
 | [cross-encoder/ms-marco-MiniLM-L-6-v2](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2) | Cross-encoder reranking model |
 | [pdfplumber](https://github.com/jsvine/pdfplumber) | Heuristic PDF table extraction as docling supplement |
 | [PyMuPDF (fitz)](https://pymupdf.readthedocs.io/) | Fast PDF metadata, TOC, hyperlinks, annotations |
+| [pytesseract](https://github.com/madmaze/pytesseract) | Python wrapper for the Tesseract OCR engine |
+| [EasyOCR](https://github.com/JaidedAI/EasyOCR) | Deep-learning OCR — no system binary required; 80+ language support |
 | [diskcache](https://grantjenks.com/docs/diskcache/) | Content-addressed persistent disk cache |
 | [Streamlit](https://streamlit.io/) | Web application framework |
 | [sentence-transformers](https://www.sbert.net/) | HuggingFace sentence embedding library + cross-encoder support |
@@ -1362,4 +1519,4 @@ cache = diskcache.Cache("./cache", size_limit=int(4e9))  # 4 GB
 
 ---
 
-*Built with Python 3.14 · LangChain 1.x · ChromaDB 1.5 · Docling 2.x · Streamlit 1.35+*
+*Built with Python 3.14 · LangChain 1.x · ChromaDB 1.5 · Docling 2.x · Streamlit 1.35+ · EasyOCR / Tesseract*

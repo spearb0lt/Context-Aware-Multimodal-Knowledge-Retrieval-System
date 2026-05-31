@@ -135,6 +135,10 @@ _SS_DEFAULTS: dict = {
     "text_ids":   [],
     "table_ids":  [],
     "image_ids":  [],
+    # OCR texts for images (parallel to images list)
+    "image_ocr_texts": [],
+    # OCR engine choice: "tesseract" | "easyocr"
+    "ocr_engine": "tesseract",
     # Docstore backing (persisted for retriever reconstruction)
     "docstore_backing": {},
     # Chat
@@ -187,6 +191,13 @@ def _load_clip():
 def _clip_db_client():
     import chromadb
     return chromadb.PersistentClient(path=CLIP_INDEX_DIR)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_easyocr_reader():
+    """Load EasyOCR reader (English). Cached for the process lifetime."""
+    import easyocr
+    return easyocr.Reader(["en"], gpu=False)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -500,6 +511,102 @@ def summarize_images(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# OCR — tesseract / easyocr text extraction from images
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_ocr_on_images(
+    images: list, pdf_hash_val: str, engine: str = "tesseract", log_fn=None
+) -> list:
+    """
+    Run OCR on each extracted image using the selected engine.
+
+    engine : "tesseract" — fast, needs system Tesseract binary + pip pytesseract
+             "easyocr"   — pure Python (pip easyocr), no system binary required,
+                           downloads ~100 MB model on first use, ~2-3× slower
+
+    Results are cached per engine under:
+        img_ocr_v1:{pdf_hash}:{engine}:{i}
+    Switching engines triggers a fresh OCR run (separate cache keys).
+    Gracefully returns empty strings if the chosen engine is unavailable.
+    """
+    import base64, io as _io
+    cache  = _disk_cache()
+    engine = engine.lower().strip()
+
+    # ── Check engine availability once ───────────────────────────────────────
+    _tess_ok = False
+    _easy_ok = False
+    _easy_reader = None
+
+    if engine == "tesseract":
+        try:
+            import pytesseract as _pt
+            _pt.get_tesseract_version()      # raises if binary not on PATH
+            _tess_ok = True
+        except Exception as _e:
+            if log_fn:
+                log_fn(
+                    f"OCR skipped — Tesseract not available: {_e}. "
+                    "Install Tesseract binary (`choco install tesseract` on Windows) "
+                    "and `pip install pytesseract`."
+                )
+    elif engine == "easyocr":
+        try:
+            _easy_reader = _load_easyocr_reader()
+            _easy_ok = True
+        except Exception as _e:
+            if log_fn:
+                log_fn(f"OCR skipped — EasyOCR not available: {_e}. `pip install easyocr`.")
+    else:
+        if log_fn:
+            log_fn(f"Unknown OCR engine '{engine}'. Choose 'tesseract' or 'easyocr'.")
+
+    _engine_ready = _tess_ok or _easy_ok
+
+    # ── Per-image OCR ─────────────────────────────────────────────────────────
+    ocr_texts = []
+    for i, img in enumerate(images):
+        ck = _ck("img_ocr_v1", pdf_hash_val, engine, i)
+        if ck in cache:
+            ocr_texts.append(cache[ck])
+            continue
+
+        if not _engine_ready:
+            cache[ck] = ""
+            ocr_texts.append("")
+            continue
+
+        text = ""
+        try:
+            from PIL import Image as _PIL
+            import numpy as _np
+            pil = _PIL.open(_io.BytesIO(base64.b64decode(img["b64"]))).convert("RGB")
+
+            if engine == "tesseract":
+                import pytesseract as _pt
+                text = _pt.image_to_string(pil).strip()
+            else:  # easyocr — requires numpy array, not PIL Image
+                results = _easy_reader.readtext(_np.array(pil), detail=0)
+                text    = " ".join(str(r) for r in results).strip()
+
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"  OCR [{engine}] failed for image {i+1}: {exc}")
+            text = ""
+
+        cache[ck] = text
+        ocr_texts.append(text)
+
+    n_extracted = sum(1 for t in ocr_texts if t)
+    if log_fn and _engine_ready:
+        log_fn(
+            f"OCR [{engine}] complete — {n_extracted}/{len(images)} images "
+            "had extractable text."
+        )
+    return ocr_texts
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PDFPLUMBER SUPPLEMENTAL TABLES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -534,6 +641,7 @@ def build_all_indexes(
     texts, tables, images, formulas, forms,
     text_summaries, table_summaries, image_summaries,
     pdf_hash_val: str, embedding_key: str,
+    image_ocr_texts: list = None,
     log_fn=None,
 ) -> tuple[list, list, list, dict]:
     """
@@ -628,6 +736,21 @@ def build_all_indexes(
             page_content=f"[{label.upper()} — page {f.get('page',-1)}] {text}",
             metadata={DOC_ID_KEY: did, "modality": "form", "raw_type": "form"},
         )])
+
+    # ── OCR text indexing (Pipeline B) ───────────────────────────────────
+    if image_ocr_texts:
+        n_ocr = 0
+        for img_id, img, ocr_text in zip(image_ids, images, image_ocr_texts):
+            if not (ocr_text and ocr_text.strip()):
+                continue
+            vs_raw.add_documents([Document(
+                page_content=f"[IMAGE OCR — page {img.get('page',-1)}]\n{ocr_text}",
+                metadata={DOC_ID_KEY: img_id, "modality": "image", "raw_type": "image_ocr",
+                          "page": img.get("page", -1)},
+            )])
+            n_ocr += 1
+        if log_fn and n_ocr:
+            log_fn(f"Indexed OCR text for {n_ocr} image(s) into Pipeline B ✓")
 
     cache[docstore_key] = backing
     if log_fn:
@@ -762,6 +885,41 @@ def _dedup(lst: list, seen: set) -> list:
         if key not in seen:
             seen.add(key); result.append(el)
     return result
+
+
+def _explorer_dense_results(query: str, ids: list, threshold: float = 0.25) -> dict:
+    """
+    Dense semantic filter for Document Explorer sub-tabs.
+    Queries the summary vectorstore and returns {doc_id: score} for results
+    whose cosine similarity to *query* meets *threshold*.
+    *ids* should be the modality-specific list (text_ids / table_ids / image_ids)
+    so only those chunks are included in the returned mapping.
+    """
+    if not query.strip() or not ids:
+        return {}
+    emb_key = st.session_state.embedding_model
+    if not st.session_state.docstore_backing:
+        return {}
+    try:
+        from langchain_chroma import Chroma
+        emb = _load_embedding_model(emb_key)
+        vs  = Chroma(
+            collection_name=f"rag_{emb_key}",
+            embedding_function=emb,
+            persist_directory=CHROMA_DIR,
+        )
+        id_set = set(ids)
+        # Use k = total collection size to avoid missing any modality items
+        k = max(vs._collection.count(), len(ids) + 10)
+        results = vs.similarity_search_with_relevance_scores(query, k=min(k, 300))
+        id_scores: dict = {}
+        for doc, score in results:
+            did = doc.metadata.get(DOC_ID_KEY)
+            if did in id_set and float(score) >= threshold:
+                id_scores[did] = round(float(score), 3)
+        return id_scores
+    except Exception:
+        return {}
 
 
 def _retrieve_with_scores_app(vs, ds, query: str, k: int) -> list:
@@ -1047,11 +1205,11 @@ def run_full_pipeline(pdf_path: str, pdf_hash_val: str, status_container) -> boo
 
     try:
         # Step 1: Docling extraction
-        _log("Step 1/7 — PDF extraction with Docling…")
+        _log("Step 1/8 — PDF extraction with Docling…")
         prog.progress(5, "Extracting PDF elements…")
         docling_key = _ck("docling_v1", pdf_hash_val)
         if docling_key in cache:
-            _log("Step 1/7 — Loaded from cache ✓ (skipping PDF parse)")
+            _log("Step 1/8 — Loaded from cache ✓ (skipping PDF parse)")
             extracted = cache[docling_key]
         else:
             extracted = run_docling_extraction(pdf_path, log_fn=_log)
@@ -1074,7 +1232,7 @@ def run_full_pipeline(pdf_path: str, pdf_hash_val: str, status_container) -> boo
         ]
 
         # Step 2: Text + Table summarization
-        _log(f"Step 2/7 — Summarizing {len(all_texts)} text chunks with Groq…")
+        _log(f"Step 2/8 — Summarizing {len(all_texts)} text chunks with Groq…")
         prog.progress(20, "Summarizing text & tables…")
         text_summaries, table_summaries = summarize_texts_and_tables(
             all_texts, tables, pdf_hash_val, groq_key, log_fn=_log
@@ -1082,37 +1240,46 @@ def run_full_pipeline(pdf_path: str, pdf_hash_val: str, status_container) -> boo
         prog.progress(45)
 
         # Step 3: Image summarization
-        _log(f"Step 3/7 — Summarizing {len(images)} images with Gemini Vision…")
+        _log(f"Step 3/8 — Summarizing {len(images)} images with Gemini Vision…")
         prog.progress(47, "Describing images…")
         image_summaries = summarize_images(images, pdf_hash_val, google_key, log_fn=_log)
         prog.progress(62)
 
-        # Step 4: CLIP embeddings
-        _log("Step 4/7 — CLIP visual embeddings…")
-        prog.progress(63, "Building CLIP index…")
-        build_clip_index(images, pdf_hash_val, log_fn=_log)
-        prog.progress(70)
+        # Step 4: OCR on images
+        ocr_engine = st.session_state.ocr_engine
+        _log(f"Step 4/8 — Running OCR on {len(images)} images with {ocr_engine}…")
+        prog.progress(63, f"OCR extraction ({ocr_engine})…")
+        image_ocr_texts = run_ocr_on_images(images, pdf_hash_val, engine=ocr_engine, log_fn=_log)
+        prog.progress(66)
 
-        # Step 5: ChromaDB multi-vector indexing
-        _log("Step 5/7 — Building ChromaDB multi-vector indexes…")
-        prog.progress(72, "Indexing into ChromaDB…")
+        # Step 5: CLIP embeddings
+        _log("Step 5/8 — CLIP visual embeddings…")
+        prog.progress(67, "Building CLIP index…")
+        build_clip_index(images, pdf_hash_val, log_fn=_log)
+        prog.progress(74)
+
+        # Step 6: ChromaDB multi-vector indexing
+        _log("Step 6/8 — Building ChromaDB multi-vector indexes…")
+        prog.progress(76, "Indexing into ChromaDB…")
         text_ids, table_ids, image_ids, backing = build_all_indexes(
             all_texts, tables, images, formulas, forms,
             text_summaries, table_summaries, image_summaries,
-            pdf_hash_val, emb_key, log_fn=_log,
+            pdf_hash_val, emb_key,
+            image_ocr_texts=image_ocr_texts,
+            log_fn=_log,
         )
         prog.progress(88)
 
-        # Step 6: pdfplumber supplemental tables
-        _log("Step 6/7 — Extracting supplemental tables with pdfplumber…")
+        # Step 7: pdfplumber supplemental tables
+        _log("Step 7/8 — Extracting supplemental tables with pdfplumber…")
         prog.progress(89, "Supplemental tables…")
         extra_tables = extract_pdfplumber_tables(pdf_path)
         if extra_tables:
             index_pdfplumber_tables(extra_tables, table_ids, pdf_hash_val, groq_key, emb_key, log_fn=_log)
         prog.progress(95)
 
-        # Step 7: Save to session state
-        _log("Step 7/7 — Finalizing…")
+        # Step 8: Save to session state
+        _log("Step 8/8 — Finalizing…")
         st.session_state.texts          = all_texts
         st.session_state.tables         = tables
         st.session_state.images         = images
@@ -1121,6 +1288,7 @@ def run_full_pipeline(pdf_path: str, pdf_hash_val: str, status_container) -> boo
         st.session_state.text_summaries = text_summaries
         st.session_state.table_summaries= table_summaries
         st.session_state.image_summaries= image_summaries
+        st.session_state.image_ocr_texts= image_ocr_texts
         st.session_state.text_ids       = text_ids
         st.session_state.table_ids      = table_ids
         st.session_state.image_ids      = image_ids
@@ -1409,6 +1577,33 @@ with st.sidebar:
             help="Auto-fallback: if this model is rate-limited, next model in list is tried automatically",
         )
 
+        st.divider()
+        ocr_choice = st.radio(
+            "OCR Engine",
+            options=["tesseract", "easyocr"],
+            format_func=lambda x: (
+                "Tesseract  (fast · needs system binary)"
+                if x == "tesseract"
+                else "EasyOCR  (pure Python · no binary · ~100 MB model)"
+            ),
+            index=["tesseract", "easyocr"].index(st.session_state.ocr_engine),
+            horizontal=False,
+            key="ocr_engine_radio",
+            help=(
+                "**Tesseract**: `choco install tesseract` (Win) / `brew install tesseract` (Mac) "
+                "+ `pip install pytesseract`\n\n"
+                "**EasyOCR**: `pip install easyocr` — no system install needed, "
+                "downloads a ~100 MB model on first use, uses CPU by default"
+            ),
+        )
+        if ocr_choice != st.session_state.ocr_engine:
+            st.session_state.ocr_engine = ocr_choice
+            st.info(
+                f"OCR engine switched to **{ocr_choice}**. "
+                "Re-process the PDF to apply to new images "
+                "(existing OCR cache for the other engine is preserved)."
+            )
+
     # ── Retrieval Settings ─────────────────────────────────────────────────
     with st.expander("⚙️ Retrieval Settings", expanded=False):
         st.session_state.k_summary  = st.slider("Pipeline A — summary k",   2, 12, st.session_state.k_summary)
@@ -1461,7 +1656,7 @@ with st.sidebar:
         if st.button("🔄 Upload New PDF", use_container_width=True):
             for k in ["rag_ready","pdf_path","pdf_hash","pdf_name","texts","tables","images",
                       "formulas","forms","text_summaries","table_summaries","image_summaries",
-                      "text_ids","table_ids","image_ids","docstore_backing","chat_history"]:
+                      "image_ocr_texts","text_ids","table_ids","image_ids","docstore_backing","chat_history"]:
                 st.session_state[k] = _SS_DEFAULTS[k]
             st.rerun()
 
@@ -1564,6 +1759,12 @@ if not st.session_state.rag_ready:
             st.session_state.pdf_meta       = ext["metadata"]
             st.session_state.pdf_pages      = ext["metadata"].get("pages", 0)
             st.session_state.docstore_backing = dict(cache.get(docstore_key, {}))
+            # Load OCR texts from cache (empty strings if OCR wasn't run previously)
+            _ocr_eng = st.session_state.ocr_engine
+            st.session_state.image_ocr_texts = [
+                cache.get(_ck("img_ocr_v1", pdf_hash_val, _ocr_eng, i), "")
+                for i in range(len(ext["images"]))
+            ]
             st.session_state.rag_ready      = True
             st.rerun()
         else:
@@ -1578,14 +1779,14 @@ if not st.session_state.rag_ready:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# READY STATE — Tabs: Chat | Document Explorer
+# READY STATE — Tabs: Chat | Document Explorer | Chunk Lookup
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 pdf_name = st.session_state.pdf_name or "Document"
 st.markdown(f"**Document:** {pdf_name} &nbsp;|&nbsp; **Pages:** {st.session_state.pdf_pages} &nbsp;|&nbsp; **Model:** `{st.session_state.answer_model}`")
 st.divider()
 
-tab_chat, tab_explorer = st.tabs(["💬 Chat", "🔍 Document Explorer"])
+tab_chat, tab_explorer, tab_lookup = st.tabs(["💬 Chat", "🔍 Document Explorer", "🔎 Chunk Lookup"])
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TAB 1: CHAT
@@ -1719,30 +1920,71 @@ with tab_explorer:
 
     with exp_tab_text:
         if st.session_state.texts:
+            search_mode_txt = st.radio(
+                "Search mode", ["Sparse (keyword)", "Dense (semantic)", "Hybrid"],
+                horizontal=True, key="txt_search_mode",
+                help="Sparse: keyword match · Dense: BGE cosine similarity · Hybrid: union of both",
+            )
             col_filter, col_pg = st.columns([3, 1])
             with col_filter:
                 search_txt = st.text_input("🔍 Filter text chunks", placeholder="Type to filter…", key="txt_search")
             with col_pg:
                 pg_filter = st.number_input("Page filter (0=all)", min_value=0, value=0, key="txt_pg")
 
-            filtered_texts = [
-                t for t in st.session_state.texts
-                if (not search_txt or search_txt.lower() in t.get("text","").lower())
-                and (not pg_filter or t.get("page") == pg_filter)
-            ]
+            # Build (orig_idx, score, element) list depending on search mode
+            txt_ids = st.session_state.text_ids
+            id_to_idx = {did: i for i, did in enumerate(txt_ids)} if txt_ids else {}
+
+            if search_mode_txt == "Sparse (keyword)":
+                filtered_texts = [
+                    (i, None, t) for i, t in enumerate(st.session_state.texts)
+                    if (not search_txt or search_txt.lower() in t.get("text","").lower())
+                    and (not pg_filter or t.get("page") == pg_filter)
+                ]
+            elif search_mode_txt == "Dense (semantic)":
+                id_scores = _explorer_dense_results(search_txt, txt_ids) if search_txt.strip() else {}
+                filtered_texts = []
+                for did, score in sorted(id_scores.items(), key=lambda x: -x[1]):
+                    if did in id_to_idx:
+                        t = st.session_state.texts[id_to_idx[did]]
+                        if pg_filter and t.get("page") != pg_filter:
+                            continue
+                        filtered_texts.append((id_to_idx[did], score, t))
+            else:  # Hybrid
+                id_scores = _explorer_dense_results(search_txt, txt_ids) if search_txt.strip() else {}
+                dense_ids = set(id_scores)
+                seen_hybrid = set()
+                filtered_texts = []
+                # Dense results first (sorted by score)
+                for did, score in sorted(id_scores.items(), key=lambda x: -x[1]):
+                    if did in id_to_idx:
+                        t = st.session_state.texts[id_to_idx[did]]
+                        if pg_filter and t.get("page") != pg_filter:
+                            continue
+                        filtered_texts.append((id_to_idx[did], score, t))
+                        seen_hybrid.add(id_to_idx[did])
+                # Then sparse-only matches
+                for i, (did, t) in enumerate(zip(txt_ids, st.session_state.texts)):
+                    if i in seen_hybrid:
+                        continue
+                    if (not search_txt or search_txt.lower() in t.get("text","").lower()) \
+                            and (not pg_filter or t.get("page") == pg_filter):
+                        filtered_texts.append((i, 0.0, t))
+
             st.caption(f"Showing {len(filtered_texts)} of {len(st.session_state.texts)} chunks")
 
-            for i, t in enumerate(filtered_texts[:100]):
+            for orig_idx, score, t in filtered_texts[:100]:
                 page  = t.get("page","?")
                 label = t.get("label","text")
                 text  = t.get("text","")
                 color = LABEL_COLORS.get(label,"#555")
-                with st.expander(f"{label.upper()} · Page {page} | {text[:80]}…", expanded=False):
+                score_str = f" · {score:.3f}" if score is not None else ""
+                with st.expander(f"{label.upper()} · Page {page}{score_str} | {text[:80]}…", expanded=False):
                     st.markdown(f'<span style="background:{color};color:white;padding:2px 8px;border-radius:10px;font-size:11px">{label.upper()}</span> **Page {page}**', unsafe_allow_html=True)
                     st.text(text)
-                    if st.session_state.text_summaries and i < len(st.session_state.text_summaries):
+                    if st.session_state.text_summaries and orig_idx < len(st.session_state.text_summaries):
                         st.caption("**LLM Summary:**")
-                        st.info(st.session_state.text_summaries[i])
+                        st.info(st.session_state.text_summaries[orig_idx])
 
             if len(filtered_texts) > 100:
                 st.caption(f"…and {len(filtered_texts)-100} more (apply filter to narrow results)")
@@ -1751,11 +1993,74 @@ with tab_explorer:
 
     with exp_tab_tables:
         if st.session_state.tables:
-            for i, tbl in enumerate(st.session_state.tables):
+            search_mode_tbl = st.radio(
+                "Search mode", ["Sparse (keyword)", "Dense (semantic)", "Hybrid"],
+                horizontal=True, key="tbl_search_mode",
+                help="Sparse: keyword match · Dense: BGE cosine similarity · Hybrid: union of both",
+            )
+            col_tbl_filter, col_tbl_pg = st.columns([3, 1])
+            with col_tbl_filter:
+                search_tbl = st.text_input("🔍 Filter tables", placeholder="Search caption or content…", key="tbl_search")
+            with col_tbl_pg:
+                tbl_pg_filter = st.number_input("Page filter (0=all)", min_value=0, value=0, key="tbl_pg")
+
+            def _tbl_matches(tbl, kw, pg):
+                if pg and tbl.get("page") != pg:
+                    return False
+                if not kw:
+                    return True
+                kw_lo = kw.lower()
+                return (kw_lo in (tbl.get("caption") or "").lower()
+                        or kw_lo in (tbl.get("markdown") or "").lower()
+                        or kw_lo in (tbl.get("html") or "").lower())
+
+            all_tables = st.session_state.tables
+            tbl_ids = st.session_state.table_ids
+            tbl_id_to_idx = {did: i for i, did in enumerate(tbl_ids)} if tbl_ids else {}
+
+            if search_mode_tbl == "Sparse (keyword)":
+                # (orig_idx, score, tbl) — no scores for sparse
+                filtered_tables = [
+                    (orig_idx, None, t) for orig_idx, t in enumerate(all_tables)
+                    if _tbl_matches(t, search_tbl, tbl_pg_filter)
+                ]
+            elif search_mode_tbl == "Dense (semantic)":
+                id_scores = _explorer_dense_results(search_tbl, tbl_ids) if search_tbl.strip() else {}
+                filtered_tables = []
+                for did, score in sorted(id_scores.items(), key=lambda x: -x[1]):
+                    if did in tbl_id_to_idx:
+                        orig_idx = tbl_id_to_idx[did]
+                        t = all_tables[orig_idx]
+                        if tbl_pg_filter and t.get("page") != tbl_pg_filter:
+                            continue
+                        filtered_tables.append((orig_idx, score, t))
+            else:  # Hybrid
+                id_scores = _explorer_dense_results(search_tbl, tbl_ids) if search_tbl.strip() else {}
+                dense_tbl_ids = set(id_scores)
+                seen_tbl = set()
+                filtered_tables = []
+                for did, score in sorted(id_scores.items(), key=lambda x: -x[1]):
+                    if did in tbl_id_to_idx:
+                        orig_idx = tbl_id_to_idx[did]
+                        t = all_tables[orig_idx]
+                        if tbl_pg_filter and t.get("page") != tbl_pg_filter:
+                            continue
+                        filtered_tables.append((orig_idx, score, t))
+                        seen_tbl.add(orig_idx)
+                for orig_idx, t in enumerate(all_tables):
+                    if orig_idx in seen_tbl:
+                        continue
+                    if _tbl_matches(t, search_tbl, tbl_pg_filter):
+                        filtered_tables.append((orig_idx, 0.0, t))
+
+            st.caption(f"Showing {len(filtered_tables)} of {len(all_tables)} tables")
+
+            for orig_idx, score, tbl in filtered_tables:
                 page    = tbl.get("page","?")
                 caption = tbl.get("caption","")
-                label   = f"Table {i+1} · Page {page}" + (f" — {caption[:60]}" if caption else "")
-                with st.expander(label, expanded=i == 0):
+                score_str = f" · {score:.3f}" if score is not None else ""
+                label   = f"Table {orig_idx+1} · Page {page}{score_str}" + (f" — {caption[:60]}" if caption else "")
+                with st.expander(label, expanded=len(filtered_tables) == 1):
                     if caption:
                         st.caption(caption)
                     md = tbl.get("markdown","")
@@ -1768,35 +2073,106 @@ with tab_explorer:
                         html = tbl.get("html","")
                         if html:
                             st.markdown(html, unsafe_allow_html=True)
-                    if st.session_state.table_summaries and i < len(st.session_state.table_summaries):
+                    if st.session_state.table_summaries and orig_idx < len(st.session_state.table_summaries):
                         st.caption("**LLM Summary:**")
-                        st.info(st.session_state.table_summaries[i])
+                        st.info(st.session_state.table_summaries[orig_idx])
         else:
             st.info("No tables extracted.")
 
     with exp_tab_images:
         if st.session_state.images:
+            search_mode_img = st.radio(
+                "Search mode", ["Sparse (keyword)", "Dense (semantic)", "Hybrid"],
+                horizontal=True, key="img_search_mode",
+                help="Sparse: keyword match · Dense: BGE cosine similarity · Hybrid: union of both",
+            )
+            col_img_filter, col_img_pg = st.columns([3, 1])
+            with col_img_filter:
+                search_img = st.text_input("🔍 Filter images", placeholder="Search caption, vision description, or OCR text…", key="img_search")
+            with col_img_pg:
+                img_pg_filter = st.number_input("Page filter (0=all)", min_value=0, value=0, key="img_pg")
+
+            img_list      = st.session_state.images
+            img_summaries = st.session_state.image_summaries or []
+            img_ocr_texts = st.session_state.image_ocr_texts or []
+            img_ids       = st.session_state.image_ids
+            img_id_to_idx = {did: i for i, did in enumerate(img_ids)} if img_ids else {}
+
+            def _img_matches_sparse(img, idx, kw, pg):
+                if pg and img.get("page") != pg:
+                    return False
+                if not kw:
+                    return True
+                kw_lo = kw.lower()
+                summary_text = img_summaries[idx] if idx < len(img_summaries) else ""
+                ocr_text     = img_ocr_texts[idx]  if idx < len(img_ocr_texts)  else ""
+                return (kw_lo in (img.get("caption") or "").lower()
+                        or kw_lo in (img.get("label") or "").lower()
+                        or kw_lo in summary_text.lower()
+                        or kw_lo in ocr_text.lower())
+
+            if search_mode_img == "Sparse (keyword)":
+                filtered_imgs = [
+                    (i, None, img) for i, img in enumerate(img_list)
+                    if _img_matches_sparse(img, i, search_img, img_pg_filter)
+                ]
+            elif search_mode_img == "Dense (semantic)":
+                id_scores = _explorer_dense_results(search_img, img_ids) if search_img.strip() else {}
+                filtered_imgs = []
+                for did, score in sorted(id_scores.items(), key=lambda x: -x[1]):
+                    if did in img_id_to_idx:
+                        idx = img_id_to_idx[did]
+                        img = img_list[idx]
+                        if img_pg_filter and img.get("page") != img_pg_filter:
+                            continue
+                        filtered_imgs.append((idx, score, img))
+            else:  # Hybrid
+                id_scores = _explorer_dense_results(search_img, img_ids) if search_img.strip() else {}
+                seen_img = set()
+                filtered_imgs = []
+                for did, score in sorted(id_scores.items(), key=lambda x: -x[1]):
+                    if did in img_id_to_idx:
+                        idx = img_id_to_idx[did]
+                        img = img_list[idx]
+                        if img_pg_filter and img.get("page") != img_pg_filter:
+                            continue
+                        filtered_imgs.append((idx, score, img))
+                        seen_img.add(idx)
+                for i, img in enumerate(img_list):
+                    if i in seen_img:
+                        continue
+                    if _img_matches_sparse(img, i, search_img, img_pg_filter):
+                        filtered_imgs.append((i, 0.0, img))
+
+            st.caption(f"Showing {len(filtered_imgs)} of {len(img_list)} images")
+
             cols_per_row = 2
-            img_list = st.session_state.images
-            for row_start in range(0, len(img_list), cols_per_row):
+            for row_start in range(0, len(filtered_imgs), cols_per_row):
                 cols = st.columns(cols_per_row)
-                for col, img in zip(cols, img_list[row_start:row_start + cols_per_row]):
+                for col, (img_idx, score, img) in zip(cols, filtered_imgs[row_start:row_start + cols_per_row]):
                     with col:
                         page    = img.get("page","?")
                         label   = img.get("label","picture")
                         caption = img.get("caption","")
                         b64     = img.get("b64","")
                         color   = LABEL_COLORS.get(label,"#555")
-                        st.markdown(f'<span style="background:{color};color:white;padding:2px 8px;border-radius:10px;font-size:11px">{label.upper()}</span> **Page {page}**', unsafe_allow_html=True)
+                        score_str = f" · {score:.3f}" if score is not None else ""
+                        st.markdown(
+                            f'<span style="background:{color};color:white;padding:2px 8px;'
+                            f'border-radius:10px;font-size:11px">{label.upper()}</span>'
+                            f' **Page {page}**{score_str}',
+                            unsafe_allow_html=True,
+                        )
                         if b64:
                             st.image(base64.b64decode(b64), use_container_width=True)
                         if caption:
                             st.caption(caption)
-                        # Show image summary if available
-                        img_idx = img_list.index(img)
-                        if st.session_state.image_summaries and img_idx < len(st.session_state.image_summaries):
+                        if img_summaries and img_idx < len(img_summaries):
                             with st.expander("Vision description", expanded=False):
-                                st.write(st.session_state.image_summaries[img_idx])
+                                st.write(img_summaries[img_idx])
+                        if img_ocr_texts and img_idx < len(img_ocr_texts) and img_ocr_texts[img_idx]:
+                            with st.expander("OCR text", expanded=False):
+                                st.text(img_ocr_texts[img_idx])
         else:
             st.info("No images extracted.")
 
@@ -1832,3 +2208,250 @@ with tab_explorer:
                 st.caption(f"`{k}` — ~{size//1024} KB")
         else:
             st.caption("No cache entries for this PDF yet.")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 3: CHUNK LOOKUP  (semantic search — no generation)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+with tab_lookup:
+    st.markdown(
+        "Search all indexed chunks semantically and see their **cosine similarity scores** — "
+        "no LLM generation is triggered."
+    )
+    st.divider()
+
+    # ── Controls ─────────────────────────────────────────────────────────────
+    cl_mode_col, cl_query_col, cl_k_col = st.columns([2, 4, 1])
+    with cl_mode_col:
+        cl_search_mode = st.radio(
+            "Search mode",
+            ["Dense (semantic)", "Sparse (keyword)", "Hybrid"],
+            key="cl_search_mode",
+            help="Dense: vectorstore cosine similarity · Sparse: keyword scan of all chunks · Hybrid: union of both",
+        )
+    with cl_query_col:
+        cl_query = st.text_input(
+            "Query",
+            placeholder="e.g. 'multi-head attention mechanism' or 'BLEU score table'…",
+            key="chunk_lookup_query",
+        )
+    with cl_k_col:
+        cl_k = st.number_input("Top-k", min_value=1, max_value=30, value=8, key="chunk_lookup_k")
+
+    cl_col_a, cl_col_b, cl_col_c = st.columns(3)
+    with cl_col_a:
+        cl_use_a = st.checkbox("Pipeline A — summary index", value=True, key="cl_use_a")
+    with cl_col_b:
+        cl_use_b = st.checkbox("Pipeline B — raw atomic index", value=True, key="cl_use_b")
+    with cl_col_c:
+        cl_use_c = st.checkbox("Pipeline C — CLIP visual index", value=True, key="cl_use_c")
+
+    cl_run = st.button("🔎 Search Chunks", type="primary", key="chunk_lookup_run",
+                       disabled=not cl_query.strip())
+
+    if cl_run and cl_query.strip():
+        backing   = st.session_state.docstore_backing
+        emb_key   = st.session_state.embedding_model
+        pdf_hash_val = st.session_state.pdf_hash
+        images_all   = st.session_state.images
+
+        if not backing:
+            st.warning("No indexed document found. Process a PDF first.")
+        else:
+            with st.spinner("Searching…"):
+                # ── Sparse helper ────────────────────────────────────────────
+                def _sparse_scan(kw: str) -> list:
+                    """Keyword scan over all docstore elements. Returns element dicts."""
+                    kw_lo = kw.lower()
+                    hits  = []
+                    for el in backing.values():
+                        if not isinstance(el, dict):
+                            continue
+                        haystack = " ".join(filter(None, [
+                            el.get("text", ""),
+                            el.get("markdown", ""),
+                            (el.get("html", "") or "")[:300],
+                            el.get("caption", ""),
+                        ]))
+                        if kw_lo in haystack.lower():
+                            hits.append(el)
+                    return hits
+
+                retriever, raw_retriever = _build_retriever(backing, emb_key)
+                vs     = retriever.vectorstore
+                vs_raw = raw_retriever.vectorstore
+                ds     = retriever.docstore
+
+                raw_results  = []
+                seen_cl      = set()
+
+                if cl_search_mode in ("Dense (semantic)", "Hybrid"):
+                    # Pipeline A
+                    if cl_use_a:
+                        hits_a = _retrieve_with_scores_app(vs, ds, cl_query, int(cl_k))
+                        raw_results.extend(hits_a)
+
+                    # Pipeline B
+                    if cl_use_b:
+                        hits_b = _retrieve_with_scores_app(vs_raw, ds, cl_query, int(cl_k))
+                        raw_results.extend(hits_b)
+
+                if cl_search_mode in ("Sparse (keyword)", "Hybrid"):
+                    sparse_hits = _sparse_scan(cl_query)
+                    raw_results.extend(sparse_hits)
+
+                # Deduplicate across A + B + sparse
+                deduped = _dedup(raw_results, seen_cl)
+
+                # Pipeline C — CLIP images (dense only / hybrid)
+                clip_hits = []
+                if cl_use_c and images_all and cl_search_mode in ("Dense (semantic)", "Hybrid"):
+                    try:
+                        clip_hits = retrieve_by_clip(cl_query, int(cl_k), images_all, pdf_hash_val)
+                        clip_hits = _dedup(clip_hits, seen_cl)
+                    except Exception as clip_err:
+                        st.caption(f"CLIP search unavailable: {clip_err}")
+
+                # Sort text/table results: dense hits by score desc, sparse-only last
+                def _sort_score(el):
+                    s = el.get("_score") if isinstance(el, dict) else None
+                    return s if s is not None else -1.0
+
+                deduped.sort(key=_sort_score, reverse=True)
+
+            # ── Results ─────────────────────────────────────────────────────
+            total_hits = len(deduped) + len(clip_hits)
+            if total_hits == 0:
+                st.info("No results found. Try a different query or enable more pipelines.")
+            else:
+                cl_ctx = classify_docs(deduped)
+
+                txt_hits   = cl_ctx["texts"]
+                tbl_hits   = cl_ctx["tables"]
+                img_hits_a = cl_ctx["images"]   # images from Pipeline A
+                all_img    = img_hits_a + clip_hits
+                all_img    = _dedup(all_img, set())
+
+                total_display = len(txt_hits) + len(tbl_hits) + len(all_img)
+                st.caption(
+                    f"**{total_display} result(s)** — "
+                    f"{len(txt_hits)} text · {len(tbl_hits)} table · {len(all_img)} image"
+                    + (" _(CLIP)_" if clip_hits else "")
+                )
+                st.divider()
+
+                rank = 1
+
+                # ── Text results ────────────────────────────────────────────
+                if txt_hits:
+                    st.markdown("#### 📝 Text Chunks")
+                    for chunk in txt_hits:
+                        page  = chunk.get("page", "?")
+                        label = chunk.get("label", "text")
+                        text  = chunk.get("text", "")
+                        score = chunk.get("_score")
+                        color = LABEL_COLORS.get(label, "#555")
+                        sc_color = (
+                            "#2e7d32" if score is not None and score >= 0.75
+                            else "#f57f17" if score is not None and score >= 0.55
+                            else "#c62828"
+                        )
+                        score_badge = (
+                            f'<span style="background:{sc_color};color:white;padding:1px 7px;'
+                            f'border-radius:8px;font-size:12px;font-weight:700">'
+                            f'cosine: {score:.3f}</span>'
+                            if score is not None else ""
+                        )
+                        header = (
+                            f"[{rank}] {label.upper()} · Page {page}"
+                            + (f" · {score:.3f}" if score is not None else "")
+                        )
+                        with st.expander(header, expanded=False):
+                            st.markdown(
+                                f'{_badge(label)} &nbsp; **Page {page}** &nbsp; {score_badge}',
+                                unsafe_allow_html=True,
+                            )
+                            st.divider()
+                            st.text(text[:2000] + ("…" if len(text) > 2000 else ""))
+                        rank += 1
+
+                # ── Table results ────────────────────────────────────────────
+                if tbl_hits:
+                    st.markdown("#### 📊 Tables")
+                    for tbl in tbl_hits:
+                        page    = tbl.get("page", "?")
+                        caption = tbl.get("caption", "")
+                        score   = tbl.get("_score")
+                        sc_color = (
+                            "#2e7d32" if score is not None and score >= 0.75
+                            else "#f57f17" if score is not None and score >= 0.55
+                            else "#c62828"
+                        )
+                        score_badge = (
+                            f'<span style="background:{sc_color};color:white;padding:1px 7px;'
+                            f'border-radius:8px;font-size:12px;font-weight:700">'
+                            f'cosine: {score:.3f}</span>'
+                            if score is not None else ""
+                        )
+                        header = (
+                            f"[{rank}] TABLE · Page {page}"
+                            + (f" · {score:.3f}" if score is not None else "")
+                            + (f" — {caption[:55]}" if caption else "")
+                        )
+                        with st.expander(header, expanded=False):
+                            st.markdown(
+                                f'{_badge("table")} &nbsp; **Page {page}** &nbsp; {score_badge}',
+                                unsafe_allow_html=True,
+                            )
+                            if caption:
+                                st.caption(caption)
+                            st.divider()
+                            md = tbl.get("markdown", "")
+                            if md:
+                                try:
+                                    st.markdown(md)
+                                except Exception:
+                                    st.code(md)
+                            else:
+                                html = tbl.get("html", "")
+                                if html:
+                                    st.markdown(html, unsafe_allow_html=True)
+                        rank += 1
+
+                # ── Image results ────────────────────────────────────────────
+                if all_img:
+                    st.markdown("#### 🖼️ Images")
+                    for img in all_img:
+                        page    = img.get("page", "?")
+                        label   = img.get("label", "picture")
+                        caption = img.get("caption", "")
+                        b64     = img.get("b64", "")
+                        score   = img.get("_score")
+                        sc_color = (
+                            "#2e7d32" if score is not None and score >= 0.75
+                            else "#f57f17" if score is not None and score >= 0.55
+                            else "#c62828"
+                        )
+                        score_badge = (
+                            f'<span style="background:{sc_color};color:white;padding:1px 7px;'
+                            f'border-radius:8px;font-size:12px;font-weight:700">'
+                            f'cosine: {score:.3f}</span>'
+                            if score is not None else
+                            '<span style="background:#607d8b;color:white;padding:1px 7px;'
+                            'border-radius:8px;font-size:12px">CLIP match</span>'
+                        )
+                        header = (
+                            f"[{rank}] {label.upper()} · Page {page}"
+                            + (f" · {score:.3f}" if score is not None else " · CLIP")
+                            + (f" — {caption[:50]}" if caption else "")
+                        )
+                        with st.expander(header, expanded=True):
+                            st.markdown(
+                                f'{_badge(label)} &nbsp; **Page {page}** &nbsp; {score_badge}',
+                                unsafe_allow_html=True,
+                            )
+                            if caption:
+                                st.caption(caption)
+                            if b64:
+                                st.image(base64.b64decode(b64), use_container_width=True)
+                        rank += 1

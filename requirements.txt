@@ -13,6 +13,10 @@ pymupdf>=1.24.0          # fitz - fast PDF reading & metadata
 pillow>=10.0.0
 lxml>=5.0.0
 
+# --- OCR (optional — install one or both) ---
+pytesseract>=0.3.10          # OCR option A — requires Tesseract system binary (see README)
+easyocr>=1.7.0               # OCR option B — pure Python deep-learning OCR, no system binary
+
 # --- LangChain Core ---
 langchain>=1.3.0
 langchain-classic>=1.0.0      # backward-compat: InMemoryStore, MultiVectorRetriever
