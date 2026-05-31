@@ -1,0 +1,127 @@
+﻿# ============================================================
+# Context-Aware Multimodal Knowledge Retrieval System
+# Pinned Requirements — verified working environment
+# Python: 3.14.4
+# Generated: 2026-05-31
+# ============================================================
+
+# --- Web UI ---
+streamlit==1.58.0
+
+# --- PDF Parsing ---
+docling==2.96.0
+pdfplumber==0.11.9
+PyMuPDF==1.27.2.3
+Pillow==12.2.0
+lxml==6.1.1
+opencv-python-headless==4.13.0.92
+
+# --- LangChain Core ---
+langchain==1.3.2
+langchain-classic==1.0.7
+langchain-core==1.4.0
+langchain-community==0.4.2
+langchain-chroma==1.1.0
+
+# --- LLM Integrations ---
+langchain-google-genai==4.2.4
+langchain-groq==1.1.2
+langchain-huggingface==1.2.2
+google-generativeai==0.8.6
+
+# --- Embeddings & Transformers ---
+sentence-transformers==5.5.1
+transformers==5.9.0
+huggingface_hub==1.17.0
+tokenizers==0.22.2
+safetensors==0.7.0
+accelerate==1.13.0
+
+# --- PyTorch (CPU build — works on all platforms) ---
+# For GPU: replace with the appropriate CUDA wheel from https://pytorch.org/get-started/locally/
+torch==2.12.0
+torchvision==0.27.0
+
+# --- CLIP Visual Embeddings ---
+open_clip_torch==3.3.0
+
+# --- Vector Store ---
+chromadb==1.5.9
+
+# --- Persistent Disk Cache ---
+diskcache==5.6.3
+
+# --- Data & Numerics ---
+pandas==3.0.3
+numpy==2.4.6
+scipy==1.17.1
+pyarrow==24.0.0
+
+# --- Tokenization ---
+tiktoken==0.13.0
+
+# --- Utilities ---
+python-dotenv==1.2.2
+tqdm==4.67.3
+tabulate==0.10.0
+Markdown==3.10.2
+matplotlib==3.10.9
+PyYAML==6.0.3
+packaging==26.2
+regex==2026.5.9
+rich==15.0.0
+click==8.4.1
+requests==2.34.2
+urllib3==2.7.0
+certifi==2026.5.20
+charset-normalizer==3.4.7
+idna==3.17
+filelock==3.29.0
+fsspec==2026.4.0
+typing_extensions==4.15.0
+
+# --- Async / HTTP ---
+aiohttp==3.13.5
+anyio==4.13.0
+httpx==0.28.1
+
+# --- Pydantic ---
+pydantic==2.13.4
+
+# --- gRPC / Protobuf (ChromaDB dependency) ---
+grpcio==1.80.0
+protobuf==5.29.6
+
+# --- Altair (Streamlit charts) ---
+altair==6.1.0
+watchdog==6.0.0
+
+# --- Jupyter / Notebook ---
+ipykernel==7.2.0
+ipython==9.14.0
+ipywidgets==8.1.8
+jupyterlab_widgets==3.0.16
+jupyter_client==8.8.0
+jupyter_core==5.9.1
+
+# --- Windows only ---
+# pywin32==311   # uncomment on Windows if not auto-installed
+
+# --- gRPC / Protobuf (ChromaDB dependency) ---
+grpcio==1.80.0
+protobuf==5.29.6
+
+# --- Altair (Streamlit charts) ---
+altair==6.1.0
+watchdog==6.0.0
+
+# --- Jupyter / Notebook ---
+ipykernel==7.2.0
+ipython==9.14.0
+ipywidgets==8.1.8
+jupyterlab_widgets==3.0.16
+jupyter_client==8.8.0
+jupyter_core==5.9.1
+
+# --- Windows only ---
+# pywin32==311   # uncomment on Windows if not auto-installed
