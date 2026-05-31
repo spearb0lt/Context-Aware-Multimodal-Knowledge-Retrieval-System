@@ -3,8 +3,11 @@
 # Requirements
 # =====================================================
 
+# --- Streamlit app ---
+streamlit>=1.35.0
+
 # --- PDF Parsing & Element Extraction ---
-unstructured[all-docs]>=0.15.0
+docling>=2.0.0               # IBM Docling — primary PDF extractor (text, tables, images)
 pdfplumber>=0.11.0
 pymupdf>=1.24.0          # fitz - fast PDF reading & metadata
 pillow>=10.0.0
@@ -43,7 +46,17 @@ matplotlib>=3.8.0
 ipywidgets>=8.0.0
 tqdm>=4.66.0
 
-# --- Jupyter ---
+# --- CLIP visual embeddings ---
+open-clip-torch>=2.24.0
+
+# --- Persistent disk cache ---
+diskcache>=5.6.0
+
+# --- Markdown rendering ---
+markdown>=3.5.0
+tabulate>=0.9.0              # required for df.to_markdown()
+
+# --- Jupyter (notebook work) ---
 ipykernel>=6.29.0
 ipython>=8.0.0
 jupyter>=1.0.0
