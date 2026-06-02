@@ -169,11 +169,26 @@ def _disk_cache():
 def _load_embedding_model(key: str):
     from langchain_huggingface import HuggingFaceEmbeddings
     cfg = EMBEDDING_CONFIGS[key]
-    return HuggingFaceEmbeddings(
-        model_name=cfg["name"],
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": cfg["normalize"], "batch_size": 32},
-    )
+
+    def _make(local_only: bool = False):
+        mkw = {"device": "cpu"}
+        if local_only:
+            mkw["local_files_only"] = True
+        return HuggingFaceEmbeddings(
+            model_name=cfg["name"],
+            model_kwargs=mkw,
+            encode_kwargs={"normalize_embeddings": cfg["normalize"], "batch_size": 32},
+        )
+
+    try:
+        return _make(local_only=False)
+    except RuntimeError as _e:
+        if "client has been closed" not in str(_e):
+            raise
+        # Python 3.14 + huggingface_hub ≥1.14: the internal httpx.Client is
+        # garbage-collected between Streamlit startup and the first worker-thread
+        # call. The model is already on disk — reload without any network calls.
+        return _make(local_only=True)
 
 
 @st.cache_resource(show_spinner=False)
@@ -1056,7 +1071,13 @@ def _rerank_docs_app(query: str, texts: list, tables: list, top_k: int = 6) -> t
         return texts, tables
     try:
         from sentence_transformers import CrossEncoder
-        ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+        try:
+            ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+        except RuntimeError as _re:
+            if "client has been closed" not in str(_re):
+                raise
+            ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512,
+                              local_files_only=True)
         pairs = []
         items = []
         for t in texts:
