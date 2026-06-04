@@ -114,6 +114,9 @@ _SS_DEFAULTS: dict = {
     "rerank_top_k":  6,
     "use_multiquery": False,
     "n_queries":     3,
+    # Text chunking (Pipeline B raw-text-chunk indexing)
+    "chunk_size":    800,
+    "chunk_overlap": 120,
     # Document state
     "rag_ready":    False,
     "pdf_path":     None,
@@ -230,6 +233,33 @@ def compute_pdf_hash(pdf_path: str) -> str:
         h.update(f.read(65536))
     h.update(str(p.stat().st_size).encode())
     return h.hexdigest()[:16]
+
+
+def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list:
+    """
+    Split a text into overlapping chunks for raw-content indexing (Pipeline B).
+    Returns the original text as a single chunk when it already fits in chunk_size.
+    Uses LangChain's RecursiveCharacterTextSplitter for sentence-aware splits.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if chunk_overlap >= chunk_size:
+        chunk_overlap = max(0, chunk_size // 4)
+    if len(text) <= chunk_size:
+        return [text]
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    except Exception:
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
+        length_function=len,
+        keep_separator=False,
+    )
+    return [c for c in splitter.split_text(text) if c.strip()]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -652,17 +682,150 @@ def extract_pdfplumber_tables(pdf_path: str) -> list:
 # INDEXING  (ChromaDB multi-vector + raw atomic + CLIP)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _build_text_chunks_into_raw(
+    texts: list, text_ids: list, formulas: list, forms: list,
+    vs_raw, backing: dict,
+    pdf_hash_val: str, embedding_key: str,
+    chunk_size: int, chunk_overlap: int,
+    log_fn=None,
+) -> list:
+    """
+    Chunk every pure-text element (excluding formulas/forms, which already have
+    their own raw entries) and index the chunks into the raw-atomic collection
+    (Pipeline B). Each chunk gets a fresh UUID + its own docstore entry holding
+    the chunk text + parent page/label/parent_id.
+
+    Idempotent: tracks chunk state in cache under
+        chunk_state_v1:{pdf_hash}:{embedding_key}
+    If chunk_size or chunk_overlap changed since the last build, old chunk
+    vectors and docstore entries are deleted before re-chunking.
+
+    Returns the list of chunk IDs created.
+    """
+    import uuid as _uuid
+    from langchain_core.documents import Document
+
+    cache           = _disk_cache()
+    chunk_state_key = _ck("chunk_state_v1", pdf_hash_val, embedding_key)
+    old_state       = cache.get(chunk_state_key) or {}
+
+    params_match = (
+        old_state.get("size")    == chunk_size and
+        old_state.get("overlap") == chunk_overlap and
+        bool(old_state.get("ids"))
+    )
+    if params_match:
+        if log_fn:
+            log_fn(f"Text chunks already indexed ({len(old_state['ids'])} chunks, "
+                   f"size={chunk_size}, overlap={chunk_overlap}) — skipping")
+        return list(old_state["ids"])
+
+    # ── Delete stale chunks from prior parameter combinations ───────────────
+    old_ids = list(old_state.get("ids") or [])
+    if old_ids:
+        try:
+            vs_raw.delete(ids=old_ids)
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"  (could not delete {len(old_ids)} stale chunk vectors: {exc})")
+        for oid in old_ids:
+            backing.pop(oid, None)
+        if log_fn:
+            log_fn(f"  Removed {len(old_ids)} stale chunk vectors from Pipeline B")
+
+    # ── Determine which entries of `texts` are pure-text (not formula/form) ─
+    # The caller merges formulas + forms into the end of `texts`, so the first
+    # (len(texts) - len(formulas) - len(forms)) items are the real text elements.
+    n_total       = len(texts)
+    n_form_likes  = len(formulas) + len(forms)
+    n_pure_text   = max(0, n_total - n_form_likes)
+
+    # ── Chunk and index ────────────────────────────────────────────────────
+    chunk_ids:  list = []
+    chunk_docs: list = []
+    skipped_short = 0
+
+    for parent_idx in range(n_pure_text):
+        parent       = texts[parent_idx]
+        ptext        = (parent.get("text") or "").strip()
+        if not ptext:
+            continue
+        parent_id    = text_ids[parent_idx] if parent_idx < len(text_ids) else ""
+        parent_page  = parent.get("page", -1)
+        parent_label = parent.get("label", "text")
+
+        chunks = _chunk_text(ptext, chunk_size, chunk_overlap)
+        for ci, ck_text in enumerate(chunks):
+            if len(ck_text.strip()) < 20:
+                skipped_short += 1
+                continue
+            cid   = str(_uuid.uuid4())
+            celem = {
+                "text":         ck_text,
+                "page":         parent_page,
+                "label":        parent_label,
+                "heading":      bool(parent.get("heading", False)),
+                "parent_id":    parent_id,
+                "chunk_index":  ci,
+                "raw_type":     "text_chunk",
+            }
+            backing[cid] = celem
+            chunk_docs.append(Document(
+                page_content=f"[TEXT CHUNK — page {parent_page}]\n{ck_text}",
+                metadata={
+                    DOC_ID_KEY:     cid,
+                    "modality":     "text",
+                    "raw_type":     "text_chunk",
+                    "page":         parent_page,
+                    "label":        parent_label,
+                    "parent_id":    parent_id or "",
+                    "chunk_index": ci,
+                },
+            ))
+            chunk_ids.append(cid)
+
+    if chunk_docs:
+        vs_raw.add_documents(chunk_docs)
+
+    cache[chunk_state_key] = {
+        "size":    chunk_size,
+        "overlap": chunk_overlap,
+        "ids":     chunk_ids,
+    }
+
+    if log_fn:
+        log_fn(
+            f"Indexed {len(chunk_docs)} text chunks into Pipeline B "
+            f"(size={chunk_size}, overlap={chunk_overlap}"
+            + (f", skipped {skipped_short} <20-char chunks" if skipped_short else "")
+            + ") ✓"
+        )
+    return chunk_ids
+
+
 def build_all_indexes(
     texts, tables, images, formulas, forms,
     text_summaries, table_summaries, image_summaries,
     pdf_hash_val: str, embedding_key: str,
     image_ocr_texts: list = None,
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
     log_fn=None,
 ) -> tuple[list, list, list, dict]:
     """
     Build summary index (Pipeline A) + raw atomic index (Pipeline B) + CLIP index (Pipeline C).
     Returns (text_ids, table_ids, image_ids, docstore_backing).
     Idempotent: if indexes already exist, returns existing IDs from cache.
+
+    Pipeline B includes:
+      - table raw markdown (one vector per table, shares table_id)
+      - formula raw text   (own UUID)
+      - form/KV raw text   (own UUID)
+      - image OCR text     (shares image_id)
+      - text chunks        (own UUID, parent_id metadata) — size/overlap
+                            controlled by chunk_size / chunk_overlap; re-chunking
+                            happens automatically if either parameter changes
+                            between runs.
     """
     import uuid as _uuid
     from langchain_chroma import Chroma
@@ -672,6 +835,7 @@ def build_all_indexes(
 
     cache        = _disk_cache()
     docstore_key = _ck("docstore_v1", pdf_hash_val, embedding_key)
+    ids_key      = _ck("ids_v1",      pdf_hash_val, embedding_key)
 
     # ── Restore from cache if already indexed ──────────────────────────────
     existing = dict(cache.get(docstore_key, {}))
@@ -681,11 +845,35 @@ def build_all_indexes(
 
     if existing and vs._collection.count() > 0:
         if log_fn:
-            log_fn(f"Index already exists ({vs._collection.count()} vectors) — skipping")
-        text_ids  = [k for k, v in existing.items() if isinstance(v, dict) and "text"  in v and "b64" not in v and "html" not in v]
-        table_ids = [k for k, v in existing.items() if isinstance(v, dict) and "html"  in v]
-        image_ids = [k for k, v in existing.items() if isinstance(v, dict) and "b64"   in v]
-        return text_ids, table_ids, image_ids, existing
+            log_fn(f"Summary index already exists ({vs._collection.count()} vectors) — reusing")
+
+        # Prefer cached ID lists; fall back to shape-based filtering for
+        # legacy caches that never persisted explicit ID lists.
+        cached_ids = cache.get(ids_key) or {}
+        if cached_ids.get("text_ids") is not None:
+            text_ids  = list(cached_ids["text_ids"])
+            table_ids = list(cached_ids.get("table_ids", []))
+            image_ids = list(cached_ids.get("image_ids", []))
+        else:
+            text_ids  = [k for k, v in existing.items()
+                         if isinstance(v, dict) and "text" in v
+                         and "b64" not in v and "html" not in v
+                         and v.get("raw_type") != "text_chunk"]
+            table_ids = [k for k, v in existing.items() if isinstance(v, dict) and "html" in v]
+            image_ids = [k for k, v in existing.items() if isinstance(v, dict) and "b64"  in v]
+            cache[ids_key] = {"text_ids": text_ids, "table_ids": table_ids, "image_ids": image_ids}
+
+        # Even on warm path, ensure chunks for the requested parameters exist
+        backing = existing
+        _build_text_chunks_into_raw(
+            texts, text_ids, formulas, forms,
+            vs_raw, backing,
+            pdf_hash_val, embedding_key,
+            chunk_size, chunk_overlap,
+            log_fn=log_fn,
+        )
+        cache[docstore_key] = backing
+        return text_ids, table_ids, image_ids, backing
 
     # ── Full indexing ───────────────────────────────────────────────────────
     docstore = InMemoryStore()
@@ -767,7 +955,17 @@ def build_all_indexes(
         if log_fn and n_ocr:
             log_fn(f"Indexed OCR text for {n_ocr} image(s) into Pipeline B ✓")
 
+    # ── Text chunking → Pipeline B ───────────────────────────────────────
+    _build_text_chunks_into_raw(
+        texts, text_ids, formulas, forms,
+        vs_raw, backing,
+        pdf_hash_val, embedding_key,
+        chunk_size, chunk_overlap,
+        log_fn=log_fn,
+    )
+
     cache[docstore_key] = backing
+    cache[ids_key]      = {"text_ids": text_ids, "table_ids": table_ids, "image_ids": image_ids}
     if log_fn:
         log_fn(f"Indexed: {len(text_ids)} texts | {len(table_ids)} tables | {len(image_ids)} images | {vs_raw._collection.count()} raw vectors")
     return text_ids, table_ids, image_ids, backing
@@ -1189,9 +1387,17 @@ def query_rag(
         "images": merged_images,
     }
 
+    # Pipeline B text hits come from raw text chunks (chunks have raw_type=text_chunk).
+    # Count them so the dashboard shows chunk-level recall separately from A texts.
+    b_chunk_hits = sum(
+        1 for el in ctx_b["texts"]
+        if isinstance(el, dict) and el.get("raw_type") == "text_chunk"
+    )
+
     stats = {
         "A_texts": len(ctx_a["texts"]), "A_tables": len(ctx_a["tables"]), "A_images": len(ctx_a["images"]),
         "B_texts": len(ctx_b["texts"]), "B_tables": len(ctx_b["tables"]),
+        "B_chunks": b_chunk_hits,
         "C_images": len(clip_imgs),
         "total_texts": len(context["texts"]), "total_tables": len(context["tables"]), "total_images": len(context["images"]),
         "hyde_used":       use_hyde and query_text != question,
@@ -1287,6 +1493,8 @@ def run_full_pipeline(pdf_path: str, pdf_hash_val: str, status_container) -> boo
             text_summaries, table_summaries, image_summaries,
             pdf_hash_val, emb_key,
             image_ocr_texts=image_ocr_texts,
+            chunk_size=int(st.session_state.chunk_size),
+            chunk_overlap=int(st.session_state.chunk_overlap),
             log_fn=_log,
         )
         prog.progress(88)
@@ -1403,11 +1611,12 @@ def render_sources(sources: dict, src_offset: int = 1) -> int:
 
 
 def render_pipeline_stats(stats: dict):
-    cols = st.columns(8)
+    cols = st.columns(9)
     labels = [
         ("A texts",  stats.get("A_texts",0),  "#007acc"),
         ("A tables", stats.get("A_tables",0), "#2e7d32"),
         ("A images", stats.get("A_images",0), "#6a1b9a"),
+        ("B chunks", stats.get("B_chunks",0), "#0277bd"),
         ("B tables", stats.get("B_tables",0), "#ad1457"),
         ("C images", stats.get("C_images",0), "#00695c"),
         ("HyDE",    "✓" if stats.get("hyde_used")       else "✗", "#795548"),
@@ -1625,6 +1834,79 @@ with st.sidebar:
                 "(existing OCR cache for the other engine is preserved)."
             )
 
+        st.divider()
+        st.markdown("**Text Chunking (Pipeline B)**")
+        st.caption(
+            "Raw text is split into overlapping chunks and embedded into the "
+            "raw-atomic store so exact-phrase queries can hit the original passage."
+        )
+        _new_cs = st.number_input(
+            "Chunk size (chars)",
+            min_value=100, max_value=4000, step=50,
+            value=int(st.session_state.chunk_size),
+            key="_chunk_size_input",
+            help="Target length of each text chunk in characters. "
+                 "800 ≈ one dense paragraph. Smaller → finer matches, more vectors.",
+        )
+        _new_co = st.number_input(
+            "Chunk overlap (chars)",
+            min_value=0, max_value=1000, step=10,
+            value=int(st.session_state.chunk_overlap),
+            key="_chunk_overlap_input",
+            help="Characters shared between consecutive chunks to avoid losing "
+                 "context at boundaries. Should be < chunk size; ~10–20% is typical.",
+        )
+        if _new_co >= _new_cs:
+            st.warning("Chunk overlap must be smaller than chunk size — "
+                       "it will be auto-reduced to chunk_size // 4 at indexing time.")
+        if (_new_cs != st.session_state.chunk_size or
+            _new_co != st.session_state.chunk_overlap):
+            st.session_state.chunk_size    = int(_new_cs)
+            st.session_state.chunk_overlap = int(_new_co)
+            if st.session_state.rag_ready:
+                st.info(
+                    "Chunk settings changed. Click **Re-chunk text** below "
+                    "(or re-process the PDF) to apply to Pipeline B."
+                )
+
+        if st.session_state.rag_ready and st.button(
+            "🧩 Re-chunk text (Pipeline B)", use_container_width=True,
+            help="Re-build text chunks in the raw-atomic index using the current "
+                 "chunk size / overlap. Other indexes (A, C, OCR, tables, formulas) "
+                 "are not touched."
+        ):
+            try:
+                from langchain_chroma import Chroma
+                _emb_k  = st.session_state.embedding_model
+                _emb    = _load_embedding_model(_emb_k)
+                _vs_raw = Chroma(
+                    collection_name=f"rag_raw_{_emb_k}",
+                    embedding_function=_emb,
+                    persist_directory=CHROMA_DIR,
+                )
+                _backing = dict(st.session_state.docstore_backing)
+                _build_text_chunks_into_raw(
+                    st.session_state.texts,
+                    st.session_state.text_ids,
+                    st.session_state.formulas,
+                    st.session_state.forms,
+                    _vs_raw, _backing,
+                    st.session_state.pdf_hash, _emb_k,
+                    int(st.session_state.chunk_size),
+                    int(st.session_state.chunk_overlap),
+                    log_fn=lambda m: None,
+                )
+                st.session_state.docstore_backing = _backing
+                _cache = _disk_cache()
+                _cache[_ck("docstore_v1", st.session_state.pdf_hash, _emb_k)] = _backing
+                st.success(
+                    f"Re-chunked with size={st.session_state.chunk_size}, "
+                    f"overlap={st.session_state.chunk_overlap} ✓"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Re-chunk failed: {exc}")
+
     # ── Retrieval Settings ─────────────────────────────────────────────────
     with st.expander("⚙️ Retrieval Settings", expanded=False):
         st.session_state.k_summary  = st.slider("Pipeline A — summary k",   2, 12, st.session_state.k_summary)
@@ -1661,9 +1943,24 @@ with st.sidebar:
             except Exception:
                 pass
             st.metric("Cache size",  f"{used_mb:.1f} MB")
-            st.metric("Text chunks", len(st.session_state.texts))
-            st.metric("Tables",      len(st.session_state.tables))
-            st.metric("Images",      len(st.session_state.images))
+            st.metric("Text elements", len(st.session_state.texts))
+            st.metric("Tables",        len(st.session_state.tables))
+            st.metric("Images",        len(st.session_state.images))
+
+            # Pipeline B raw text-chunk count (current size/overlap)
+            try:
+                _chunk_state = _disk_cache().get(
+                    _ck("chunk_state_v1", st.session_state.pdf_hash, emb_key)
+                ) or {}
+                _n_chunks = len(_chunk_state.get("ids") or [])
+            except Exception:
+                _n_chunks = 0
+            st.metric("Text chunks (B)", _n_chunks)
+            st.caption(
+                f"chunk_size={st.session_state.chunk_size} · "
+                f"overlap={st.session_state.chunk_overlap}"
+            )
+
             st.caption(f"Hash: `{st.session_state.pdf_hash}`")
             st.caption(f"Pages: {st.session_state.pdf_pages}")
 
